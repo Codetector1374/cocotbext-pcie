@@ -411,6 +411,9 @@ class Tlp:
         """Compute byte length from DWORD length and byte enables"""
         return self.length*4 - self.get_first_be_offset() - self.get_last_be_offset()
 
+    def get_address_dw(self):
+        return self.address >> 2
+
     def get_lower_address(self):
         """Compute lower address field from address and first byte enable"""
         return self.address & 0x7c + self.get_first_be_offset()
