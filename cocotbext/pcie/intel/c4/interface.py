@@ -50,6 +50,20 @@ class BaseBus(Bus):
         return cls(entity, prefix, **kwargs)
 
 
+class C4TxBus(BaseBus):
+    _signals = ["data", "sop", "eop", "valid", "ready", "err"]
+    _optional_signals = []
+
+
+class C4DecoupledTxBus(C4TxBus):
+    _signals = {
+        signal: signal if signal in {'valid', 'ready'} else f'bits_{signal}' for signal in C4TxBus._signals
+    }
+    _optional_signals = {
+        signal: f'bits_{signal}' for signal in C4TxBus._optional_signals
+    }
+
+
 class C4RxBus(BaseBus):
     _signals = ["valid", "ready", "data", "sop", "eop", "err", "be", "bardec"]
     _optional_signals = []
@@ -60,7 +74,7 @@ class C4DecoupledRxBus(C4RxBus):
         signal: signal if signal in {'valid', 'ready'} else f'bits_{signal}' for signal in C4RxBus._signals
     }
     _optional_signals = {
-        signal: signal if signal in {'valid', 'ready'} else f'bits_{signal}' for signal in C4RxBus._optional_signals
+        signal: f'bits_{signal}' for signal in C4RxBus._optional_signals
     }
 
 
@@ -99,7 +113,15 @@ class C4PcieFrame:
             hdr.extend(struct.pack('>L', dw))
         tlp = Tlp.unpack_header(hdr)
 
-        for dw in self.data[tlp.get_header_size_dw():]:
+        alignment_padding = 0
+        if tlp.has_data():
+            is_qword_aligned = (tlp.get_address_dw() & 1) == 0
+            insert_alignment_dw = (tlp.get_header_size_dw() == 3 and is_qword_aligned) or \
+                                  (tlp.get_header_size_dw() == 4 and not is_qword_aligned)
+            if insert_alignment_dw:
+                alignment_padding += 1
+
+        for dw in self.data[tlp.get_header_size_dw()+alignment_padding:]:
             tlp.data.extend(struct.pack('<L', dw))
 
         return tlp
@@ -373,3 +395,162 @@ class C4PcieSource(C4PcieBase):
         self.queue_occupancy_bytes -= len(frame)
         self.queue_occupancy_frames -= 1
         return frame
+
+
+class C4PcieSink(C4PcieBase):
+
+    _signal_widths = {"valid": 1, "ready": 1}
+
+    _valid_signal = "valid"
+    _ready_signal = "ready"
+
+    _transaction_obj = C4PcieTransaction
+    _frame_obj = C4PcieFrame
+
+    def __init__(self, bus, clock, reset=None, ready_latency=0, *args, **kwargs):
+        super().__init__(bus, clock, reset, ready_latency, *args, **kwargs)
+
+        self.sample_obj = None
+        self.sample_sync = Event()
+
+        self.queue_occupancy_limit_bytes = -1
+        self.queue_occupancy_limit_frames = -1
+
+        self.bus.ready.setimmediatevalue(0)
+
+        cocotb.start_soon(self._run_sink())
+        cocotb.start_soon(self._run())
+
+    def _recv(self, frame):
+        if self.queue.empty():
+            self.active_event.clear()
+        self.queue_occupancy_bytes -= len(frame)
+        self.queue_occupancy_frames -= 1
+        return frame
+
+    async def recv(self):
+        frame = await self.queue.get()
+        return self._recv(frame)
+
+    def recv_nowait(self):
+        frame = self.queue.get_nowait()
+        return self._recv(frame)
+
+    def full(self):
+        if 0 < self.queue_occupancy_limit_bytes < self.queue_occupancy_bytes:
+            return True
+        elif 0 < self.queue_occupancy_limit_frames < self.queue_occupancy_frames:
+            return True
+        else:
+            return False
+
+    def idle(self):
+        return not self.active
+
+    async def wait(self, timeout=0, timeout_unit='ns'):
+        if not self.empty():
+            return
+        if timeout:
+            await First(self.active_event.wait(), Timer(timeout, timeout_unit))
+        else:
+            await self.active_event.wait()
+
+    async def _run_sink(self):
+        ready_delay = []
+
+        clock_edge_event = RisingEdge(self.clock)
+
+        while True:
+            await clock_edge_event
+
+            # read handshake signals
+            ready_sample = self.bus.ready.value
+            valid_sample = self.bus.valid.value
+
+            if self.reset is not None and self.reset.value:
+                self.bus.ready.value = 0
+                continue
+
+            # ready delay
+            if self.ready_latency > 0:
+                if len(ready_delay) != self.ready_latency:
+                    ready_delay = [0]*self.ready_latency
+                ready_delay.append(ready_sample)
+                ready_sample = ready_delay.pop(0)
+
+            if valid_sample and ready_sample:
+                self.sample_obj = self._transaction_obj()
+                self.bus.sample(self.sample_obj)
+                self.sample_sync.set()
+            elif self.ready_latency > 0:
+                assert not valid_sample, "handshake error: valid asserted outside of ready cycle"
+
+            self.bus.ready.value = (not self.full() and not self.pause)
+
+    async def _run(self):
+        self.active = False
+        frame = None
+        hdr_buffer = None
+        dword_count = 0
+
+        while True:
+            while not self.sample_obj:
+                self.sample_sync.clear()
+                await self.sample_sync.wait()
+
+            self.active = True
+            sample = self.sample_obj
+            self.sample_obj = None
+
+            if not sample.valid & 1:
+                continue
+
+            if sample.sop & 1:
+                assert frame is None, "framing error: sop asserted in frame"
+                frame = C4PcieFrame()
+                hdr_buffer = sample.data
+                frame.err = sample.err
+                dword_count = 2
+            elif hdr_buffer is not None:    # Second half of header
+                assert sample.sop == 0, "SOP on second frame"
+                hdr = (sample.data << 64) | hdr_buffer
+                hdr_buffer = None
+                fmt = (hdr >> 29) & 0b111
+                is4dw = fmt & 0b001
+                if is4dw:
+                    dword_count = 2
+                else:
+                    dword_count = 1
+
+                if fmt & 0b010:  # has data
+                    count = hdr & 0x3ff
+                    if count == 0:
+                        count = 1024
+                    qw_aligned = ((hdr >> 88) & 0b100) != 0 if not is4dw else ((hdr >> 120) & 0b100)
+                    if (not is4dw and qw_aligned) or (is4dw and not qw_aligned):
+                        dword_count += 1
+                    dword_count += count
+
+                frame.err |= sample.err
+
+            assert frame is not None, "framing error: data transferred outside of frame"
+
+            if dword_count > 0:
+                data = sample.data
+                for k in range(min(self.byte_lanes, dword_count)):
+                    frame.data.append((data >> 32*k) & 0xffffffff)
+                    dword_count -= 1
+
+            if sample.eop:
+                assert dword_count == 0, "framing error: incorrect length or early eop"
+                self.log.info("RX frame: %r", frame)
+                self._sink_frame(frame)
+                self.active = False
+                frame = None
+
+    def _sink_frame(self, frame):
+        self.queue_occupancy_bytes += len(frame)
+        self.queue_occupancy_frames += 1
+
+        self.queue.put_nowait(frame)
+        self.active_event.set()
