@@ -59,13 +59,15 @@ class C4DecoupledRxBus(C4RxBus):
     _signals = {
         signal: signal if signal in {'valid', 'ready'} else f'bits_{signal}' for signal in C4RxBus._signals
     }
-    _optional_signals = []
+    _optional_signals = {
+        signal: signal if signal in {'valid', 'ready'} else f'bits_{signal}' for signal in C4RxBus._optional_signals
+    }
 
 
 class C4PcieFrame:
     def __init__(self, frame=None):
         self.data = []
-        self.bardec = 0
+        self.bardec = 0b00000001
         self.err = 0
 
         if isinstance(frame, Tlp):
@@ -130,7 +132,7 @@ class C4PcieFrame:
 
 class C4PcieTransaction:
 
-    _signals = ["valid", "ready", "data", "sop", "eop", "err", "be", "bardec"]
+    _signals = ["valid", "data", "sop", "eop", "err", "be", "bardec"]
 
     def __init__(self, *args, **kwargs):
         for sig in self._signals:
@@ -338,10 +340,11 @@ class C4PcieSource(C4PcieBase):
 
                 if self.width == 128 and frame_offset == 0:
                     transaction.bardec = frame.bardec
-                elif self.width == 64 and frame_offset == 1:
+                elif self.width == 64 and frame_offset == 2:
                     transaction.bardec = frame.bardec
                 else:
                     transaction.bardec = 0
+
                 transaction.err = frame.err
 
                 if frame.data:
