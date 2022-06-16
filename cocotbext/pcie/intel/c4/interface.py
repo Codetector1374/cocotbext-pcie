@@ -31,7 +31,7 @@ from cocotb.queue import Queue, QueueFull
 from cocotb.triggers import RisingEdge, Timer, First, Event
 from cocotb_bus.bus import Bus
 
-from cocotbext.pcie.core.tlp import Tlp
+from cocotbext.pcie.core.tlp import Tlp, TlpType
 
 
 class BaseBus(Bus):
@@ -115,11 +115,14 @@ class C4PcieFrame:
 
         alignment_padding = 0
         if tlp.has_data():
-            is_qword_aligned = (tlp.get_address_dw() & 1) == 0
+            if tlp.fmt_type in {TlpType.CPL_DATA, TlpType.CPL_LOCKED_DATA}:
+                is_qword_aligned = (tlp.lower_address & 0b100) == 0
+            else:
+                is_qword_aligned = (tlp.get_address_dw() & 1) == 0
             insert_alignment_dw = (tlp.get_header_size_dw() == 3 and is_qword_aligned) or \
                                   (tlp.get_header_size_dw() == 4 and not is_qword_aligned)
             if insert_alignment_dw:
-                alignment_padding += 1
+                alignment_padding = 1
 
         for dw in self.data[tlp.get_header_size_dw()+alignment_padding:]:
             tlp.data.extend(struct.pack('<L', dw))
@@ -516,7 +519,7 @@ class C4PcieSink(C4PcieBase):
                 hdr = (sample.data << 64) | hdr_buffer
                 hdr_buffer = None
                 fmt = (hdr >> 29) & 0b111
-                is4dw = fmt & 0b001
+                is4dw = (fmt & 0b001) != 0
                 if is4dw:
                     dword_count = 2
                 else:
@@ -526,7 +529,7 @@ class C4PcieSink(C4PcieBase):
                     count = hdr & 0x3ff
                     if count == 0:
                         count = 1024
-                    qw_aligned = ((hdr >> 88) & 0b100) != 0 if not is4dw else ((hdr >> 120) & 0b100)
+                    qw_aligned = ((hdr >> 64) & 0b100) == 0 if not is4dw else ((hdr >> 96) & 0b100) == 0
                     if (not is4dw and qw_aligned) or (is4dw and not qw_aligned):
                         dword_count += 1
                     dword_count += count
